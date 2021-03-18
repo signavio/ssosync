@@ -32,6 +32,7 @@ type SyncGSuite interface {
 	SyncUsers() error
 	SyncGroups() error
 	DeleteUnmappedUsers() error
+	DeleteUnneededGroups() error
 }
 
 // SyncGSuite is an object type that will synchronise real users and groups
@@ -44,6 +45,7 @@ type syncGSuite struct {
 }
 
 var usersMappedToGroups []*aws.User
+var unneededGroups []*aws.Group
 
 // New will create a new SyncGSuite object
 func New(cfg *config.Config, a aws.Client, g google.Client) SyncGSuite {
@@ -157,13 +159,19 @@ func (s *syncGSuite) SyncGroups() error {
 	for _, g := range googleGroups {
 		if len(s.cfg.AddGroups) != 0 {
 			if !s.addGroup(g.Email) {
-				log.Error("Do not add group ", g.Email)
+				log.Info("Do not add group: ", g.Email)
+				groupInAWS, err := s.aws.FindGroupByDisplayName(g.Email)
+				if err != nil && err != aws.ErrGroupNotFound {
+					return err
+				}
+				if groupInAWS != nil {
+					unneededGroups = append(unneededGroups, groupInAWS)
+				}
 				continue
 			}
 		} else {
-			log.Error("addgroup parameter is empty")
 			if s.ignoreGroup(g.Email) {
-				log.Error("Inside Ignore Group block check")
+				log.Info("Checking if group needs to be ignored: ", g.Email)
 				continue
 			}
 		}
@@ -216,16 +224,15 @@ func (s *syncGSuite) SyncGroups() error {
 			if err != nil {
 				return err
 			}
-
 			if _, ok := memberList[u.Username]; ok {
 				if !b {
 					log.WithField("user", u.Username).Info("Adding user to group")
-					usersMappedToGroups = append(usersMappedToGroups, u)
 					err := s.aws.AddUserToGroup(u, group)
 					if err != nil {
 						return err
 					}
 				}
+				usersMappedToGroups = append(usersMappedToGroups, u)
 			} else {
 				if b {
 					log.WithField("user", u.Username).Info("Removing user from group")
@@ -292,6 +299,11 @@ func DoSync(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
+	err = c.DeleteUnneededGroups()
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -320,6 +332,17 @@ func (s *syncGSuite) DeleteUnmappedUsers() error {
 				}).Warn("Error deleting user")
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func (s *syncGSuite) DeleteUnneededGroups() error {
+	for _, g := range unneededGroups {
+		log.Info("Deleting AWS SSO Group: ", g.DisplayName)
+		err := s.aws.DeleteGroup(g)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
